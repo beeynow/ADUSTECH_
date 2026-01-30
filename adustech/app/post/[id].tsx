@@ -152,7 +152,7 @@ export default function PostDetail() {
         <View style={[styles.composerWrap, { backgroundColor: card, borderTopColor: isDark ? 'rgba(66,165,245,0.25)' : 'rgba(25,118,210,0.15)' }]}> 
           <TextInput
             style={[styles.composerInput, { color: textPrimary }]} value={text} onChangeText={setText}
-            placeholder="Add a comment..." placeholderTextColor={muted}
+            placeholder="Add a comment...." placeholderTextColor={muted}
           />
           <TouchableOpacity
             onPress={async () => {
