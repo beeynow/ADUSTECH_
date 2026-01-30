@@ -1,6 +1,4 @@
-
-
-const User = require("../models/User");
+const { prisma } = require('../config/db');
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const { 
@@ -8,9 +6,9 @@ const {
     sendOtpEmail,
     sendResendOtpEmail,
     sendPasswordResetEmail,
-    sendPasswordChangedEmail
+    sendPasswordChangedEmail,
+    sendRoleChangeEmail
 } = require('../utils/sendEmail');
-const { sendRoleChangeEmail } = require('../utils/sendEmail');
 
 const POWER_ADMIN_EMAIL = process.env.POWER_ADMIN_EMAIL || '';
 
@@ -22,7 +20,7 @@ exports.register = async (req, res) => {
     try {
         console.log('📝 Registration attempt:', { name: req.body.name, email: req.body.email });
         
-        const { name, email, password } =  req.body;
+        const { name, email, password } = req.body;
         
         // Validate input
         if (!name || !email || !password) {
@@ -30,7 +28,7 @@ exports.register = async (req, res) => {
             return res.status(400).json({ message: 'All fields are required' });
         }
         
-        let existing = await User.findOne({ email });
+        const existing = await prisma.user.findUnique({ where: { email } });
 
         if (existing) {
             console.log('❌ User already exists:', email);
@@ -42,8 +40,16 @@ exports.register = async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, 10);
 
         const role = email === POWER_ADMIN_EMAIL ? 'power' : 'user';
-        const user = new User({ name, email, password: hashedPassword, otp, otpExpiry, role });
-        await user.save();
+        const user = await prisma.user.create({
+            data: {
+                name,
+                email,
+                password: hashedPassword,
+                otp,
+                otpExpiry,
+                role
+            }
+        });
         
         console.log('✅ User saved to database');
         console.log('📧 OTP generated:', otp, '(for testing - check this in console)');
@@ -64,57 +70,75 @@ exports.verifyOTP = async (req, res) => {
         const { email, otp } = req.body;
         const now = new Date();
 
-        // Atomic verify update
-        const updated = await User.findOneAndUpdate(
-            { email, otp, otpExpiry: { $gte: now }, isVerified: false },
-            { $set: { isVerified: true }, $unset: { otp: "", otpExpiry: "" } },
-            { new: true }
-        );
-
-        if (updated) {
-            // Send welcome email upon successful verification
-            await sendWelcomeEmail(updated.email, updated.name);
-            return res.json({ message: 'Email verified successfully. you can now log in.', isVerified: updated.isVerified });
+        const user = await prisma.user.findUnique({ where: { email } });
+        
+        if (!user) {
+            return res.status(400).json({ message: 'User not found' });
+        }
+        
+        if (user.isVerified) {
+            return res.status(400).json({ message: 'User already verified' });
+        }
+        
+        if (!user.otp || !user.otpExpiry || user.otp !== otp) {
+            return res.status(400).json({ message: 'Invalid or expired OTP' });
+        }
+        
+        if (user.otpExpiry < now) {
+            return res.status(400).json({ message: 'Invalid or expired OTP' });
         }
 
-        // No match: diagnose and return precise message
-        const user = await User.findOne({ email });
-        if (!user) return res.status(400).json({ message: 'User not found' });
-        if (user.isVerified) return res.status(400).json({ message: 'User already verified' });
-        if (user.otpExpiry < now) return res.status(400).json({ message: 'Invalid or expired OTP' });
-        return res.status(400).json({ message: 'Invalid or expired OTP' });
+        // Update user to verified and clear OTP
+        const updated = await prisma.user.update({
+            where: { email },
+            data: {
+                isVerified: true,
+                otp: null,
+                otpExpiry: null
+            }
+        });
+
+        // Send welcome email upon successful verification
+        await sendWelcomeEmail(updated.email, updated.name);
+        return res.json({ message: 'Email verified successfully. you can now log in.', isVerified: updated.isVerified });
     } catch (error) {
-        res.status(500).json({ message: 'Error verifying OTP', error });
+        console.error('❌ Verify OTP error:', error);
+        res.status(500).json({ message: 'Error verifying OTP', error: error.message });
     }
-}
+};
 
 // Resend OTP
 exports.resendOTP = async (req, res) => {
     try {
-        const { email } =  req.body;
-        let user = await User.findOne({ email });
+        const { email } = req.body;
+        const user = await prisma.user.findUnique({ where: { email } });
 
         if (!user) return res.status(400).json({ message: 'User not found'});
         if (user.isVerified) return res.status(400).json({ message: 'User already verified'});
 
         const otp = generateOTP();
-        user.otp = otp;
-        user.otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
-        await user.save();
+        await prisma.user.update({
+            where: { email },
+            data: {
+                otp,
+                otpExpiry: new Date(Date.now() + 10 * 60 * 1000)
+            }
+        });
 
         await sendResendOtpEmail(email, user.name, otp);
 
         res.json({ message: 'OTP resent successfully' });
     } catch (error) {
-        res.status(500).json({ message: 'Error resending OTP', error });
+        console.error('❌ Resend OTP error:', error);
+        res.status(500).json({ message: 'Error resending OTP', error: error.message });
     }
 };
 
 // Login User
 exports.login = async (req, res) => {
     try {
-        const { email, password } =  req.body;
-        let user = await User.findOne({ email });
+        const { email, password } = req.body;
+        const user = await prisma.user.findUnique({ where: { email } });
 
         if (!user) return res.status(400).json({ message: 'User not found'});
         
@@ -126,26 +150,31 @@ exports.login = async (req, res) => {
         }
 
         // Ensure POWER_ADMIN_EMAIL always has role 'power'
+        let userRole = user.role;
         if (user.email === POWER_ADMIN_EMAIL && user.role !== 'power') {
-            user.role = 'power';
-            await user.save();
+            await prisma.user.update({
+                where: { email },
+                data: { role: 'power' }
+            });
+            userRole = 'power';
         }
 
         // Store user session
-        req.session.user = { id: user._id, email: user.email, name: user.name, role: user.role };
+        req.session.user = { id: user.id, email: user.email, name: user.name, role: userRole };
         
         // Return user data along with success message
         res.status(200).json({ 
             message: 'Login successful', 
             user: { 
-                id: user._id, 
+                id: user.id, 
                 email: user.email, 
                 name: user.name,
-                role: user.role,
+                role: userRole,
             }
         });
     } catch (error) {
-        res.status(500).json({ message: 'Error logging in', error });
+        console.error('❌ Login error:', error);
+        res.status(500).json({ message: 'Error logging in', error: error.message });
     }
 };
 
@@ -166,13 +195,17 @@ exports.dashboard = async (req, res) => {
 exports.forgotPassword = async (req, res) => {
     try {
         const { email } = req.body;
-        const user = await User.findOne({ email });
+        const user = await prisma.user.findUnique({ where: { email } });
         if (!user) return res.status(200).json({ message: 'If that email exists, a reset code has been sent.' });
 
         const resetToken = crypto.randomInt(100000, 999999).toString();
-        user.resetPasswordToken = resetToken;
-        user.resetPasswordExpires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
-        await user.save();
+        await prisma.user.update({
+            where: { email },
+            data: {
+                resetPasswordToken: resetToken,
+                resetPasswordExpires: new Date(Date.now() + 60 * 60 * 1000) // 1 hour
+            }
+        });
 
         await sendPasswordResetEmail(user.email, user.name, resetToken);
         res.json({ message: 'Password reset code sent to your email.' });
@@ -186,7 +219,7 @@ exports.forgotPassword = async (req, res) => {
 exports.resetPassword = async (req, res) => {
     try {
         const { email, token, newPassword } = req.body;
-        const user = await User.findOne({ email });
+        const user = await prisma.user.findUnique({ where: { email } });
         if (!user) return res.status(400).json({ message: 'Invalid reset request' });
 
         if (!user.resetPasswordToken || !user.resetPasswordExpires || user.resetPasswordToken !== token) {
@@ -197,10 +230,14 @@ exports.resetPassword = async (req, res) => {
         }
 
         const hashed = await bcrypt.hash(newPassword, 10);
-        user.password = hashed;
-        user.resetPasswordToken = undefined;
-        user.resetPasswordExpires = undefined;
-        await user.save();
+        await prisma.user.update({
+            where: { email },
+            data: {
+                password: hashed,
+                resetPasswordToken: null,
+                resetPasswordExpires: null
+            }
+        });
 
         await sendPasswordChangedEmail(user.email, user.name);
         res.json({ message: 'Password has been reset successfully.' });
@@ -216,14 +253,17 @@ exports.changePassword = async (req, res) => {
         const { currentPassword, newPassword } = req.body;
         const userId = req.session.user?.id;
         if (!userId) return res.status(401).json({ message: 'Unauthorized' });
-        const user = await User.findById(userId);
+        
+        const user = await prisma.user.findUnique({ where: { id: userId } });
         if (!user) return res.status(404).json({ message: 'User not found' });
 
         const match = await bcrypt.compare(currentPassword, user.password);
         if (!match) return res.status(400).json({ message: 'Current password is incorrect' });
 
-        user.password = await bcrypt.hash(newPassword, 10);
-        await user.save();
+        await prisma.user.update({
+            where: { id: userId },
+            data: { password: await bcrypt.hash(newPassword, 10) }
+        });
 
         await sendPasswordChangedEmail(user.email, user.name);
         res.json({ message: 'Password changed successfully.' });
@@ -249,29 +289,40 @@ exports.createAdmin = async (req, res) => {
             return res.status(400).json({ message: 'Invalid role. Allowed: admin, d-admin' });
         }
 
-        const existing = await User.findOne({ email });
+        const existing = await prisma.user.findUnique({ where: { email } });
         if (existing) {
             // Enforce single position per email
             if (existing.role !== 'user') {
                 return res.status(400).json({ message: 'This email already has a position assigned' });
             }
-            existing.name = name;
-            existing.password = await bcrypt.hash(password, 10);
             const previousRole = existing.role || 'user';
-            existing.role = role;
-            existing.isVerified = true; // Admins assumed verified by creator
-            await existing.save();
+            const updated = await prisma.user.update({
+                where: { email },
+                data: {
+                    name,
+                    password: await bcrypt.hash(password, 10),
+                    role,
+                    isVerified: true
+                }
+            });
             // Notify user of role change
-            await sendRoleChangeEmail(existing.email, existing.name, previousRole, role);
-            return res.json({ message: 'User promoted to admin successfully', user: { id: existing._id, email: existing.email, name: existing.name, role: existing.role } });
+            await sendRoleChangeEmail(updated.email, updated.name, previousRole, role);
+            return res.json({ message: 'User promoted to admin successfully', user: { id: updated.id, email: updated.email, name: updated.name, role: updated.role } });
         }
 
         const hashed = await bcrypt.hash(password, 10);
-        const newAdmin = new User({ name, email, password: hashed, role, isVerified: true });
-        await newAdmin.save();
+        const newAdmin = await prisma.user.create({
+            data: {
+                name,
+                email,
+                password: hashed,
+                role,
+                isVerified: true
+            }
+        });
         // Notify user of role change
         await sendRoleChangeEmail(newAdmin.email, newAdmin.name, 'user', role);
-        return res.status(201).json({ message: 'Admin created successfully', user: { id: newAdmin._id, email: newAdmin.email, name: newAdmin.name, role: newAdmin.role } });
+        return res.status(201).json({ message: 'Admin created successfully', user: { id: newAdmin.id, email: newAdmin.email, name: newAdmin.name, role: newAdmin.role } });
     } catch (error) {
         console.error('Create admin error', error);
         res.status(500).json({ message: 'Error creating admin' });
@@ -285,7 +336,18 @@ exports.listAdmins = async (req, res) => {
         if (!requester || requester.role !== 'power') {
             return res.status(403).json({ message: 'Forbidden: Only power admin can list admins' });
         }
-        const admins = await User.find({ role: { $in: ['power', 'admin', 'd-admin'] } }).select('_id name email role createdAt');
+        const admins = await prisma.user.findMany({
+            where: {
+                role: { in: ['power', 'admin', 'd-admin'] }
+            },
+            select: {
+                id: true,
+                name: true,
+                email: true,
+                role: true,
+                createdAt: true
+            }
+        });
         res.json({ admins });
     } catch (error) {
         console.error('List admins error', error);
@@ -302,16 +364,22 @@ exports.demoteAdmin = async (req, res) => {
         }
         const { email } = req.body;
         if (!email) return res.status(400).json({ message: 'Email is required' });
-        const user = await User.findOne({ email });
+        
+        const user = await prisma.user.findUnique({ where: { email } });
         if (!user) return res.status(404).json({ message: 'User not found' });
         if (user.role === 'user') return res.status(400).json({ message: 'User is not an admin' });
+        
         // Prevent demoting the primary power admin
         if (user.role === 'power' && email === POWER_ADMIN_EMAIL) {
             return res.status(400).json({ message: 'Cannot demote the primary power admin' });
         }
+        
         const previousRole = user.role;
-        user.role = 'user';
-        await user.save();
+        await prisma.user.update({
+            where: { email },
+            data: { role: 'user' }
+        });
+        
         // Notify user of role change
         await sendRoleChangeEmail(user.email, user.name, previousRole, 'user');
         res.json({ message: 'Admin demoted to user successfully' });

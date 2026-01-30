@@ -1,77 +1,116 @@
-const Timetable = require('../models/Timetable');
-const cloudinary = require('../utils/cloudinary');
+const { prisma } = require('../config/db');
+const { uploadToCloudinary } = require('../utils/cloudinary');
 
+// List active timetables (not expired)
+exports.listTimetables = async (req, res) => {
+    try {
+        const now = new Date();
+        
+        const timetables = await prisma.timetable.findMany({
+            where: {
+                expiresAt: { gte: now } // Only show non-expired timetables
+            },
+            include: {
+                createdBy: {
+                    select: { id: true, name: true, email: true }
+                }
+            },
+            orderBy: { effectiveDate: 'desc' }
+        });
+
+        res.json({ timetables });
+    } catch (error) {
+        console.error('List timetables error:', error);
+        res.status(500).json({ message: 'Error fetching timetables', error: error.message });
+    }
+};
+
+// Create timetable (admin only)
 exports.createTimetable = async (req, res) => {
-  try {
-    const user = req.session.user;
-    if (!user) return res.status(401).json({ message: 'Unauthorized' });
-    if (!['power','admin','d-admin'].includes(user.role)) {
-      return res.status(403).json({ message: 'Only admins can create timetables' });
+    try {
+        const user = req.session.user;
+        if (!user || !['power', 'admin', 'd-admin'].includes(user.role)) {
+            return res.status(403).json({ message: 'Forbidden: Admin access required' });
+        }
+
+        const { title, details, effectiveDate, imageUrl, pdfUrl } = req.body;
+
+        if (!title || !effectiveDate) {
+            return res.status(400).json({ message: 'Title and effective date are required' });
+        }
+
+        const effDate = new Date(effectiveDate);
+        // Expires at end of effective day (11:59:59 PM)
+        const expiresAt = new Date(effDate);
+        expiresAt.setHours(23, 59, 59, 999);
+
+        const timetable = await prisma.timetable.create({
+            data: {
+                title,
+                details: details || '',
+                effectiveDate: effDate,
+                expiresAt,
+                imageUrl: imageUrl || '',
+                pdfUrl: pdfUrl || '',
+                createdById: user.id,
+                createdByName: user.name
+            },
+            include: {
+                createdBy: {
+                    select: { id: true, name: true, email: true }
+                }
+            }
+        });
+
+        res.status(201).json({ message: 'Timetable created successfully', timetable });
+    } catch (error) {
+        console.error('Create timetable error:', error);
+        res.status(500).json({ message: 'Error creating timetable', error: error.message });
     }
-
-    let { title = '', details = '', imageBase64 = '', pdfBase64 = '', effectiveDate } = req.body;
-    title = String(title || '').trim();
-    details = String(details || '').trim();
-    const date = new Date(effectiveDate);
-    if (!title) return res.status(400).json({ message: 'Title is required' });
-    if (!effectiveDate || isNaN(date.getTime())) return res.status(400).json({ message: 'Valid effectiveDate is required' });
-
-    let imageUrl = '';
-    if (imageBase64) {
-      const match = /^data:(image\/(png|jpeg|jpg|webp));base64,(.+)$/i.exec(imageBase64);
-      if (!match) return res.status(400).json({ message: 'Invalid image format' });
-      const uploadRes = await cloudinary.uploader.upload(imageBase64, { folder: 'adustech/timetables', resource_type: 'image' });
-      imageUrl = uploadRes.secure_url;
-      imageBase64 = '';
-    }
-
-    let pdfUrl = '';
-    if (pdfBase64) {
-      const matchPdf = /^data:(application\/pdf);base64,(.+)$/i.exec(pdfBase64);
-      if (!matchPdf) return res.status(400).json({ message: 'Invalid PDF format' });
-      const uploadPdf = await cloudinary.uploader.upload(pdfBase64, { folder: 'adustech/timetables', resource_type: 'raw', public_id: `tt_${Date.now()}` });
-      pdfUrl = uploadPdf.secure_url;
-      pdfBase64 = '';
-    }
-
-    const endOfDay = new Date(date); endOfDay.setHours(23,59,59,999);
-
-    const row = await Timetable.create({
-      title,
-      details,
-      imageUrl,
-      pdfUrl,
-      effectiveDate: date,
-      expireAt: endOfDay,
-      createdBy: user.id,
-      createdByName: user.name || user.email,
-    });
-    res.status(201).json({ message: 'Timetable created', timetable: row });
-  } catch (e) {
-    console.error('createTimetable error', e);
-    res.status(500).json({ message: 'Error creating timetable' });
-  }
 };
 
-exports.listTimetables = async (_req, res) => {
-  try {
-    const now = new Date();
-    const list = await Timetable.find({ expireAt: { $gt: now } }).sort({ effectiveDate: 1 });
-    res.json({ timetables: list });
-  } catch (e) {
-    console.error('listTimetables error', e);
-    res.status(500).json({ message: 'Error listing timetables' });
-  }
-};
-
+// Get single timetable
 exports.getTimetable = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const row = await Timetable.findById(id);
-    if (!row) return res.status(404).json({ message: 'Timetable not found' });
-    res.json({ timetable: row });
-  } catch (e) {
-    console.error('getTimetable error', e);
-    res.status(500).json({ message: 'Error fetching timetable' });
-  }
+    try {
+        const { id } = req.params;
+
+        const timetable = await prisma.timetable.findUnique({
+            where: { id },
+            include: {
+                createdBy: {
+                    select: { id: true, name: true, email: true }
+                }
+            }
+        });
+
+        if (!timetable) {
+            return res.status(404).json({ message: 'Timetable not found' });
+        }
+
+        // Check if expired
+        if (timetable.expiresAt < new Date()) {
+            return res.status(404).json({ message: 'Timetable has expired' });
+        }
+
+        res.json({ timetable });
+    } catch (error) {
+        console.error('Get timetable error:', error);
+        res.status(500).json({ message: 'Error fetching timetable', error: error.message });
+    }
+};
+
+// Clean up expired timetables (can be run periodically)
+exports.cleanupExpiredTimetables = async () => {
+    try {
+        const now = new Date();
+        const result = await prisma.timetable.deleteMany({
+            where: {
+                expiresAt: { lt: now }
+            }
+        });
+        console.log(`🧹 Cleaned up ${result.count} expired timetables`);
+        return result;
+    } catch (error) {
+        console.error('Cleanup expired timetables error:', error);
+    }
 };
