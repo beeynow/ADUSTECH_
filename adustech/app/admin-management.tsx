@@ -44,7 +44,7 @@ export default function AdminManagementScreen() {
     }
     Alert.alert(
       'Demote Admin',
-      `Are you sure you want to demote ${email} to user?.`,
+      `Are you sure you want to demote ${email} to user?`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
