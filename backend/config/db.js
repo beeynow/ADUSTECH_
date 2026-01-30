@@ -4,7 +4,7 @@ const MONGO_URL = "mongodb+srv://myusman137_db_user:nIGUdB9ZSA4dO5aT@cluster0.5v
 
 const connectDB = async () => {
     try {
-        // Connect to MongoDB
+        // Connect to MongoDB ;
         await mongoose.connect(MONGO_URL);
         console.log('MongoDB Connected successfully');
         // Create the empty User collection
